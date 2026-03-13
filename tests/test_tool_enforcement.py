@@ -24,16 +24,28 @@ class FakeToolCall:
         self.function.arguments = json.dumps(arguments)
 
 
+class StubGuardrailAdapter:
+    def __init__(self, action: str):
+        self.action = action
+        self.requests = []
+
+    async def evaluate_tool_call(self, request):
+        self.requests.append(request)
+        return self.action
+
+
 class TestExecuteToolCallsEnforcement:
     """Test that _execute_tool_calls enforces task-type restrictions."""
 
     def setup_method(self):
         router = ModelRouter()
+        self.guardrail = StubGuardrailAdapter("allow")
         self.engine = IterationEngine(
             router,
             tool_registry=MagicMock(),
             approval_gate=None,
             agent_id="test-agent",
+            guardrail_adapter=self.guardrail,
         )
         # Mock the registry execute to return success
         self.engine.tool_registry.execute = AsyncMock(
@@ -65,6 +77,8 @@ class TestExecuteToolCallsEnforcement:
         records = await self.engine._execute_tool_calls(calls, task_id="t1", task_type="coding")
         assert len(records) == 1
         assert records[0].success is True
+        assert self.guardrail.requests[0].requested_tool_name == "shell"
+        assert self.guardrail.requests[0].requested_command == "ls"
 
     @pytest.mark.asyncio
     async def test_allows_general_tool_for_any_task(self):
@@ -101,6 +115,42 @@ class TestExecuteToolCallsEnforcement:
         assert len(records) == 2
         assert records[0].success is True  # web_search allowed
         assert records[1].success is False  # shell blocked
+
+    @pytest.mark.asyncio
+    async def test_guardrail_allow_permits_tool_execution(self):
+        """Guardrail allow should pass through to the tool registry."""
+        calls = [FakeToolCall("shell", {"command": "ls"})]
+        records = await self.engine._execute_tool_calls(calls, task_id="t1", task_type="coding")
+
+        assert len(records) == 1
+        assert records[0].success is True
+        self.engine.tool_registry.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guardrail_block_prevents_tool_execution(self):
+        """Guardrail block should stop execution and return a failed ToolResult."""
+        self.engine.guardrail_adapter = StubGuardrailAdapter("block")
+        calls = [FakeToolCall("shell", {"command": "ls"})]
+
+        records = await self.engine._execute_tool_calls(calls, task_id="t1", task_type="coding")
+
+        assert len(records) == 1
+        assert records[0].success is False
+        assert "Blocked by Guardrail" in records[0].result
+        self.engine.tool_registry.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_guardrail_unknown_action_prevents_tool_execution(self):
+        """Unknown Guardrail actions should fail closed."""
+        self.engine.guardrail_adapter = StubGuardrailAdapter("mystery_action")
+        calls = [FakeToolCall("shell", {"command": "ls"})]
+
+        records = await self.engine._execute_tool_calls(calls, task_id="t1", task_type="coding")
+
+        assert len(records) == 1
+        assert records[0].success is False
+        assert "Unknown Guardrail action: mystery_action" in records[0].result
+        self.engine.tool_registry.execute.assert_not_awaited()
 
 
 class TestTaskQueueAssignedResetOnLoad:

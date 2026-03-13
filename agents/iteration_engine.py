@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 
 from agents.model_router import ModelRouter
 from core.approval_gate import ProtectedAction
+from core.guardrail import DefiantGuardrailAdapter, GuardrailRequest
 from providers.registry import PROVIDERS, ProviderType, SpendingLimitExceeded
+from tools.base import ToolResult
 
 logger = logging.getLogger("agent42.iteration")
 
@@ -209,12 +211,16 @@ class IterationEngine:
         approval_gate=None,
         agent_id: str = "default",
         extension_loader=None,
+        guardrail_adapter=None,
     ):
         self.router = router
         self.tool_registry = tool_registry
         self.approval_gate = approval_gate
         self.agent_id = agent_id
         self.extension_loader = extension_loader
+        self.guardrail_adapter = guardrail_adapter or DefiantGuardrailAdapter()
+        self._current_task_text = ""
+        self._current_step_text = ""
         # Models that failed during the current task — excluded from fallback attempts.
         # Reset at the start of each run(). Prevents wasting time retrying models
         # that are known-broken (e.g. Gemini daily quota exhausted, OR model 404'd).
@@ -590,12 +596,49 @@ class IterationEngine:
             if self.extension_loader and self.extension_loader.has_extensions:
                 arguments = self.extension_loader.call_before_tool_call(tool_name, arguments)
 
-            logger.info(f"Executing tool: {tool_name}({list(arguments.keys())})")
-            result = await self.tool_registry.execute(
-                tool_name,
-                agent_id=self.agent_id,
-                **arguments,
+            guardrail_request = GuardrailRequest(
+                text=self._current_step_text or self._current_task_text,
+                requested_tool_name=tool_name,
+                requested_command=self._extract_requested_command(arguments),
+                identity_context={"agent_id": self.agent_id},
             )
+            guardrail_action = await self.guardrail_adapter.evaluate_tool_call(guardrail_request)
+            logger.info(
+                "Guardrail outcome: %s for tool=%s agent_id=%s",
+                guardrail_action,
+                tool_name,
+                self.agent_id,
+            )
+
+            if guardrail_action == "allow":
+                logger.info(f"Executing tool: {tool_name}({list(arguments.keys())})")
+                result = await self.tool_registry.execute(
+                    tool_name,
+                    agent_id=self.agent_id,
+                    **arguments,
+                )
+            elif guardrail_action == "block":
+                result = ToolResult(success=False, error="Blocked by Guardrail")
+            elif guardrail_action == "require_approval":
+                result = ToolResult(success=False, error="Guardrail requires approval")
+            elif guardrail_action == "escalate":
+                result = ToolResult(success=False, error="Guardrail escalated this action")
+            elif guardrail_action == "redact":
+                result = ToolResult(
+                    success=False,
+                    error="Guardrail requested redaction before execution",
+                )
+            else:
+                logger.warning(
+                    "Unknown Guardrail action %r for tool=%s agent_id=%s",
+                    guardrail_action,
+                    tool_name,
+                    self.agent_id,
+                )
+                result = ToolResult(
+                    success=False,
+                    error=f"Unknown Guardrail action: {guardrail_action}",
+                )
 
             # Call after_tool_call extension hooks
             if self.extension_loader and self.extension_loader.has_extensions:
@@ -674,6 +717,8 @@ class IterationEngine:
         """
         self._token_acc = token_accumulator or TokenAccumulator()
         self._failed_models = set()  # Reset per-task failed model tracking
+        self._current_task_text = task_description
+        self._current_step_text = task_description
         history = IterationHistory()
         messages = []
 
@@ -894,6 +939,7 @@ class IterationEngine:
         or MAX_TOOL_ROUNDS is reached.
         """
         working_messages = list(messages)
+        self._current_step_text = self._extract_guardrail_text(working_messages)
 
         for round_num in range(MAX_TOOL_ROUNDS):
             # Re-fetch schemas each round so dynamically created tools are
@@ -937,6 +983,7 @@ class IterationEngine:
                 for tc in message.tool_calls
             ]
             working_messages.append(assistant_msg)
+            self._current_step_text = self._extract_guardrail_text(working_messages)
 
             records = await self._execute_tool_calls(
                 message.tool_calls, task_id=task_id, task_type=task_type
@@ -952,6 +999,7 @@ class IterationEngine:
                         "content": record.result,
                     }
                 )
+            self._current_step_text = self._extract_guardrail_text(working_messages)
 
             logger.info(f"Tool round {round_num + 1}: {len(records)} calls, continuing...")
 
@@ -1033,6 +1081,26 @@ class IterationEngine:
             ]
 
         return await self._complete_with_retry(critic_model, messages)
+
+    @staticmethod
+    def _extract_requested_command(arguments: dict) -> str | None:
+        """Pull a likely command field from tool arguments when present."""
+        for key in ("command", "cmd", "shell_command", "script"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
+    @staticmethod
+    def _extract_guardrail_text(messages: list[dict]) -> str:
+        """Use the latest user instruction text as the current Guardrail context."""
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+        return ""
 
     @staticmethod
     def _extract_screenshot_b64(records: list[ToolCallRecord]) -> str | None:
